@@ -1,0 +1,103 @@
+# Builds FairShare as a static site and publishes it to GitHub Pages:
+# https://sims03.github.io/FairShare/
+#
+# Every third-party action is pinned to a full commit SHA (the version tag is in the comment).
+# A tag like "v7" can be moved by whoever controls the action's repo; a SHA can't, so a hijacked
+# action can't silently swap in new code. To update: look up the new tag's SHA, e.g.
+#   git ls-remote https://github.com/actions/checkout.git refs/tags/v7.0.1
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # adds a "Run workflow" button in the Actions tab
+
+# Least privilege: read the code, publish to Pages, and prove to Pages who we are (OIDC token).
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one deployment at a time; a newer push doesn't cancel a deployment that's already running.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # later steps don't need git push rights
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies (exactly what package-lock.json says)
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      # These two values are PUBLIC by design: they end up in the JavaScript bundle that every
+      # visitor downloads, and row-level security in the database is what protects the data.
+      # That's why they're repository *variables* (Settings > Secrets and variables > Actions >
+      # Variables), not secrets. NEVER put the Supabase secret key (sb_secret_...) here or anywhere
+      # in this workflow: anything in the build is published to the whole internet.
+      - name: Check the Supabase settings
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+        run: |
+          if [ -z "$NEXT_PUBLIC_SUPABASE_URL" ] || [ -z "$NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY" ]; then
+            echo "::error::Missing repository variables NEXT_PUBLIC_SUPABASE_URL and/or NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY. Add them under Settings > Secrets and variables > Actions > Variables. Without them the live site would only show the 'connect Supabase' setup screen."
+            exit 1
+          fi
+          case "$NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY" in
+            sb_secret_*)
+              echo "::error::NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY holds a SECRET key (sb_secret_...). Use the publishable key (sb_publishable_...), and rotate the secret key in Supabase since it may have leaked."
+              exit 1
+              ;;
+          esac
+
+      - name: Build the static site (into out/)
+        env:
+          GITHUB_PAGES: "true" # next.config.ts: static export + "/FairShare" base path
+          NEXT_PUBLIC_SUPABASE_URL: ${{ vars.NEXT_PUBLIC_SUPABASE_URL }}
+          NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${{ vars.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY }}
+        run: npm run build
+
+      # Looks for an actual key (prefix + key characters). The bare text "sb_secret_" is in the
+      # supabase-js library itself (it checks which kind of key it was given), so that alone is fine.
+      - name: Make sure no secret key ended up in the site
+        run: |
+          if grep -rlE "sb_secret_[A-Za-z0-9_-]{10,}" out; then
+            echo "::error::A file in out/ contains a Supabase secret key (sb_secret_...). Not deploying."
+            exit 1
+          fi
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+
+      # No .nojekyll needed: when Pages deploys from Actions it serves the files as they are
+      # (no Jekyll step), so the "_next" folder is published fine.
+      - name: Upload the site
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

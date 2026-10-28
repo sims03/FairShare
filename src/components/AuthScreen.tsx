@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { getSupabase } from "@/lib/supabase";
+import { appHomeUrl } from "@/lib/site";
 import { card, input, primaryButton } from "@/lib/styles";
 import { SplitScreen } from "./SplitScreen";
 import { ErrorNote, Notice, PageTitle } from "./ui";
@@ -27,7 +28,8 @@ export function AuthScreen({ invited }: { invited: boolean }) {
       const { data, error } = await auth.signUp({
         email,
         password,
-        options: { emailRedirectTo: window.location.origin },
+        // After clicking the confirmation email, come back to the app (including "/FairShare/" on Pages).
+        options: { emailRedirectTo: appHomeUrl() },
       });
       if (error) setError(error.message);
       else if (!data.session) setNotice("Almost there! Check your inbox to confirm your email, then sign in here.");

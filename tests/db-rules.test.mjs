@@ -110,6 +110,41 @@ const PERMISSION_DENIED = "42501";
 /** A client with no session at all (a signed-out visitor). */
 const anonClient = () => createClient(URL_, KEY, { auth: { persistSession: false, autoRefreshToken: false } });
 
+let manualSql = "";
+/** The manual hidden-history / premium check, filled with this run's real ids. Run it in the Supabase SQL Editor. */
+function historySql(h, userId, taskId) {
+  return `-- A) Create old logs as the admin (SQL Editor runs as 'postgres': it ignores row-level security and column rights).
+--    The trigger must be switched off just for this insert, otherwise it stamps every row with now().
+--    begin/commit makes it all-or-nothing: if the insert fails, the trigger is NOT left switched off.
+begin;
+alter table public.logs disable trigger logs_stamp_at;
+insert into public.logs (household_id, task_id, user_id, at) values
+  ('${h}', '${taskId}', '${userId}', now() - interval '1 month'),
+  ('${h}', '${taskId}', '${userId}', now() - interval '3 months'),
+  ('${h}', '${taskId}', '${userId}', now() - interval '5 months'),
+  ('${h}', '${taskId}', '${userId}', now() - interval '7 months');
+alter table public.logs enable trigger logs_stamp_at;
+commit;
+-- (Alternative without touching the trigger: insert normally, then 'update public.logs set at = now() - interval ...
+--  where id = ...'. The trigger only runs on INSERT, and postgres may update 'at'.)
+
+-- B) Check the trigger is back on: tgenabled must be 'O' (= enabled).
+select tgname, tgenabled from pg_trigger where tgname = 'logs_stamp_at' and not tgisinternal;
+
+-- C) FREE plan (plan = 'free'). Sign in to the app as that member and open History, or run in the browser console
+--    / test script: select at from logs where household_id = '${h}'.
+--    Expected: the 1-month-old log is visible; the 3-, 5- and 7-month-old logs are hidden.
+--    The owner of a hidden log also cannot edit or delete it (update/delete change 0 rows).
+
+-- D) PREMIUM plan (the app's members can't do this, only the admin can):
+update public.households set plan = 'premium' where id = '${h}';
+--    Expected now: 1, 3 and 5 months visible (and editable/deletable by their owner); the 7-month-old log still hidden.
+
+-- E) Put it back and clean up (logs are never deleted by the app, so remove the test rows by hand):
+update public.households set plan = 'free' where id = '${h}';
+delete from public.logs where household_id = '${h}' and at < now() - interval '20 days';`;
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -341,8 +376,9 @@ async function main() {
   // =========================================================================
   console.log("\n--- 2. Own-log updates ---");
   // =========================================================================
-  const myLog = await alex.sb.from("logs").insert({ household_id: A, task_id: billTask }).select("id").single();
-  const lid = myLog.data?.id;
+  const lid = randomUUID();
+  const myLog = await alex.sb.from("logs").insert({ id: lid, household_id: A, task_id: billTask, at: new Date().toISOString() });
+  check("Alex logs 'Paid a bill' the way the app does (id, household_id, task_id, at)", !myLog.error, "insert logs", myLog.error ? `error ${myLog.error.code}: ${myLog.error.message}` : `status ${myLog.status}`, "no error");
   const up1 = await alex.sb.from("logs").update({ detail: "Electricity", amount: 45.2, note: "Paid online" }).eq("id", lid).select("detail, amount::text, note");
   check("Updating detail/amount/note on own log works",
     !up1.error && up1.data?.[0]?.detail === "Electricity" && up1.data?.[0]?.amount === "45.20" && up1.data?.[0]?.note === "Paid online",
@@ -351,9 +387,19 @@ async function main() {
   rejected("Updating another member's log affects 0 rows", "update Alex's log by Sam", up2);
   const after = await alex.sb.from("logs").select("detail").eq("id", lid).single();
   check("Alex's log detail unchanged after Sam's attempt", after.data?.detail === "Electricity", "select log", show(after.data), "Electricity");
-  errored("Updating 'at' is denied", "update logs at", await alex.sb.from("logs").update({ at: daysAgo(1) }).eq("id", lid).select("id"));
-  errored("Updating 'task_id' is denied", "update logs task_id", await alex.sb.from("logs").update({ task_id: task }).eq("id", lid).select("id"));
-  errored("Updating 'user_id' is denied", "update logs user_id=Sam", await alex.sb.from("logs").update({ user_id: sam.id }).eq("id", lid).select("id"));
+  errored("Updating 'at' is denied (42501)", "update logs at", await alex.sb.from("logs").update({ at: daysAgo(1) }).eq("id", lid).select("id"), PERMISSION_DENIED);
+  errored("Updating 'task_id' is denied (42501)", "update logs task_id", await alex.sb.from("logs").update({ task_id: task }).eq("id", lid).select("id"), PERMISSION_DENIED);
+  errored("Updating 'user_id' is denied (42501)", "update logs user_id=Sam", await alex.sb.from("logs").update({ user_id: sam.id }).eq("id", lid).select("id"), PERMISSION_DENIED);
+  errored("Updating 'household_id' on a log is denied (42501)", "update logs household_id=B", await alex.sb.from("logs").update({ household_id: B }).eq("id", lid).select("id"), PERMISSION_DENIED);
+  const lidRow = await alex.sb.from("logs").select("household_id, user_id, task_id").eq("id", lid).single();
+  check("Log row unchanged after those attempts", lidRow.data?.household_id === A && lidRow.data?.user_id === alex.id && lidRow.data?.task_id === billTask,
+    "select log", show(lidRow.data), "household A, user Alex, task billTask");
+  // The app deletes with only .eq("id") and no .select(): make sure that shape works too.
+  const delId = randomUUID();
+  await alex.sb.from("logs").insert({ id: delId, household_id: A, task_id: task, at: new Date().toISOString() });
+  const delRes = await alex.sb.from("logs").delete().eq("id", delId);
+  const delGone = await alex.sb.from("logs").select("id").eq("id", delId);
+  check("Undo exactly as the app does it (delete by id, no .select()) removes the row", !delRes.error && delGone.data?.length === 0, "delete logs by id", delRes.error ? delRes.error.message : `status ${delRes.status}`, "no error, row gone");
 
   // =========================================================================
   console.log("\n--- 6. Constraint violations on logs ---");
@@ -378,46 +424,73 @@ async function main() {
   errored("Updating amount to -5 rejected", "update amount=-5", upBad, "23514");
 
   // =========================================================================
-  console.log("\n--- 3. History floor (free plan = 2 months) ---");
+  console.log("\n--- 3. History floor (free plan = 2 months) and the server-stamped 'at' (migration 003) ---");
   // =========================================================================
+  // Before 003 a client could choose `at`, so old rows could be created through the API. Now the trigger
+  // logs_stamp_at overwrites `at` with now(): the insert SUCCEEDS but the stored time is the server's.
+  const stampCases = [
+    ["3 months ago", monthsAgo(3)],
+    ["1 month ago", monthsAgo(1)],
+    ["1 week ago", daysAgo(7)],
+    ["the year 2000", "2000-01-01T00:00:00Z"],
+    ["1 year in the FUTURE", new Date(Date.now() + 365 * 86400000).toISOString()],
+  ];
+  const stampedIds = {};
+  for (const [label, at] of stampCases) {
+    const id = randomUUID();
+    const r = await alex.sb.from("logs").insert({ id, household_id: A, task_id: task, at }).select("id, at");
+    const row = r.data?.[0];
+    check(`Insert with at = ${label} succeeds, but 'at' is stored as server now (within 60s)`,
+      !r.error && !!row && nearNow(row.at), `insert logs at=${at} .select("id, at")`, brief(r) + " " + show(row), "no error; stored at within 60s of now");
+    stampedIds[label] = id;
+  }
+  // Same without .select() (the app's shape), then read the row back later: the stored value must still be "now".
   const oldId = randomUUID();
-  const oldAt = monthsAgo(3);
-  // No .select(): the row is hidden by the read policy, so asking for it back would look like a failure.
-  const oldIns = await alex.sb.from("logs").insert({ id: oldId, household_id: A, task_id: task, at: oldAt });
-  check(`BACK-DATING GAP: insert of a log with at = 3 months ago ${oldIns.error ? "was refused" : "SUCCEEDED (gap confirmed)"}`,
-    true, "", oldIns.error ? `error ${oldIns.error.code}: ${oldIns.error.message}` : `status ${oldIns.status}`);
-  console.log(`INFO  back-dating insert result: ${oldIns.error ? "REFUSED " + oldIns.error.message : "ACCEPTED (client can choose 'at'), gap exists"}`);
-  const oldSel = await alex.sb.from("logs").select("id").eq("id", oldId);
-  check("3-month-old log is NOT returned by select", !oldSel.error && oldSel.data.length === 0, "select by id", brief(oldSel), "0 rows");
-  rejected("3-month-old log cannot be updated", "update old log", await alex.sb.from("logs").update({ detail: "edit" }).eq("id", oldId).select("id"));
-  rejected("3-month-old log cannot be deleted", "delete old log", await alex.sb.from("logs").delete().eq("id", oldId).select("id"));
-  const oldAll = await alex.sb.from("logs").select("id, at").eq("household_id", A).lt("at", monthsAgo(2));
-  check("No log older than 2 months appears in a household-wide select", !oldAll.error && oldAll.data.length === 0, "select logs at < 2 months ago", brief(oldAll), "0 rows");
+  const oldIns = await alex.sb.from("logs").insert({ id: oldId, household_id: A, task_id: task, at: monthsAgo(3) });
+  const oldBack = await alex.sb.from("logs").select("id, at").eq("id", oldId);
+  check("Back-dated insert without .select(): accepted, and reading it back later shows at = server now",
+    !oldIns.error && oldBack.data?.length === 1 && nearNow(oldBack.data[0].at), "insert at=3 months ago, then select by id",
+    (oldIns.error ? `insert error ${oldIns.error.message}` : `insert status ${oldIns.status}`) + "; " + brief(oldBack) + " " + show(oldBack.data?.[0]),
+    "no error; 1 row with at within 60s of now");
 
-  const midId = randomUUID();
-  const mid = await alex.sb.from("logs").insert({ id: midId, household_id: A, task_id: task, at: monthsAgo(1) });
-  check("Insert of a log 1 month ago succeeds", !mid.error, "insert at = 1 month ago", mid.error ? mid.error.message : `status ${mid.status}`, "no error");
+  // Because a back-dated row now lands at "now", it is visible and its owner can still edit it.
+  // (These replace the old "1-month-old log is visible / editable" checks, which only made sense when the client could choose `at`.)
+  const midId = stampedIds["1 month ago"];
   const midSel = await alex.sb.from("logs").select("id").eq("id", midId);
-  check("1-month-old log IS visible", !midSel.error && midSel.data.length === 1, "select by id", brief(midSel), "1 row");
-  accepted("1-month-old own log can be updated", "update 1-month-old log", await alex.sb.from("logs").update({ note: "ok" }).eq("id", midId).select("id"));
+  check("Log submitted with at = 1 month ago is visible (it was stamped now)", !midSel.error && midSel.data.length === 1, "select by id", brief(midSel), "1 row");
+  accepted("...and its owner can update it", "update that log", await alex.sb.from("logs").update({ note: "ok" }).eq("id", midId).select("id"));
+  const samHist = await sam.sb.from("logs").select("id").eq("id", midId);
+  check("Sam (member) sees it too", samHist.data?.length === 1, "select by id as Sam", brief(samHist), "1 row");
 
-  // Week range (same shape as the app's loadHousehold) and History range query
+  const oldAll = await alex.sb.from("logs").select("id, at").eq("household_id", A).lt("at", monthsAgo(2));
+  check("No log older than 2 months appears in a household-wide select (now trivially true for normal users)",
+    !oldAll.error && oldAll.data.length === 0, "select logs at < 2 months ago", brief(oldAll), "0 rows");
+
+  console.log("SKIP  Hidden-history behaviour (3-month-old log hidden on free, not updatable/deletable, visible on premium):");
+  console.log("      a normal user can no longer create an old row, so this can only be tested with a row created by an admin.");
+  console.log("      The old script checks 'hidden / cannot update / cannot delete' are therefore REMOVED, not failing. Manual steps:");
+  manualSql = historySql(A, alex.id, task);
+  console.log(manualSql.split("\n").map((l) => "      | " + l).join("\n"));
+
+  // Week range (same shape as the app's loadHousehold: the last 7 days) and History range query
   const weekStart = new Date(); weekStart.setDate(weekStart.getDate() - 7);
   const week = await alex.sb.from("logs").select("id, task_id, user_id, at, detail, amount::text, note").eq("household_id", A).gte("at", weekStart.toISOString()).order("at");
-  check("Week-range select works and returns this week's logs", !week.error && week.data.length >= 3, "select logs gte 7 days ago", brief(week), ">= 3 rows");
+  check("Week-range select (1-week-old range) works and returns this week's logs, all inside the range",
+    !week.error && week.data.length >= 3 && week.data.every((l) => new Date(l.at) >= weekStart), "select logs gte 7 days ago", brief(week), ">= 3 rows, all at >= 7 days ago");
   const hist = await alex.sb.from("logs").select("id").eq("household_id", A).gte("at", monthsAgo(3)).lt("at", new Date(Date.now() + 60000).toISOString()).order("at", { ascending: false }).order("id", { ascending: false }).range(0, 199);
-  check("History-style range select (from 3 months ago) works and includes the 1-month log but not the 3-month one",
-    !hist.error && hist.data.some((l) => l.id === midId) && !hist.data.some((l) => l.id === oldId), "select logs range", brief(hist), "mid included, old excluded");
-  const samHist = await sam.sb.from("logs").select("id").eq("id", midId);
-  check("Sam (member) sees Alex's 1-month-old log too", samHist.data?.length === 1, "select by id as Sam", brief(samHist), "1 row");
-  const futureIns = await alex.sb.from("logs").insert({ household_id: A, task_id: task, at: new Date(Date.now() + 365 * 86400000).toISOString() });
-  console.log(`INFO  log with at = 1 year in the FUTURE: ${futureIns.error ? "refused: " + futureIns.error.message : "ACCEPTED (also not limited)"}`);
+  check("History-style range select (from 3 months ago) works and includes every log made in this run (all stamped now)",
+    !hist.error && [oldId, midId, ...Object.values(stampedIds)].every((id) => hist.data.some((l) => l.id === id)), "select logs range", brief(hist), "all back-dated test logs included");
 
   // =========================================================================
   console.log("\n--- 4. Currency and plan ---");
   // =========================================================================
   const cur = await sam.sb.from("households").update({ currency: "MKD" }).eq("id", A).select("currency");
   check("A member (Sam) can set currency to MKD", !cur.error && cur.data?.[0]?.currency === "MKD", "update currency=MKD", brief(cur), "currency = MKD");
+  const curApp = await alex.sb.from("households").update({ currency: "USD" }).eq("id", A);
+  const curBack = await alex.sb.from("households").select("currency").eq("id", A).single();
+  check("Currency change exactly as the app does it (no .select()) works", !curApp.error && curBack.data?.currency === "USD", "update currency=USD (no select)",
+    (curApp.error ? curApp.error.message : `status ${curApp.status}`) + "; now " + show(curBack.data), "no error, currency = USD");
+  await alex.sb.from("households").update({ currency: "MKD" }).eq("id", A);
   errored("Currency 'XYZ' rejected", "update currency=XYZ", await sam.sb.from("households").update({ currency: "XYZ" }).eq("id", A).select("currency"), "23514");
   errored("Member updating plan is denied", "update plan='premium'", await sam.sb.from("households").update({ plan: "premium" }).eq("id", A).select("plan"));
   errored("Member updating name is denied", "update name", await sam.sb.from("households").update({ name: "Renamed" }).eq("id", A).select("name"));
@@ -431,15 +504,27 @@ async function main() {
   await alex.sb.from("households").update({ currency: "EUR" }).eq("id", A);
 
   // Direct-write attempts on other tables (not in the brief, cheap and relevant)
-  errored("Member cannot insert into household_members directly (only via join_household)", "insert household_members",
-    await bea.sb.from("household_members").insert({ household_id: A, user_id: bea.id, display_name: "Bea" }).select("user_id"));
-  errored("Member cannot update their own role", "update household_members role", await sam.sb.from("household_members").update({ role: "owner" }).eq("user_id", sam.id).select("role"));
+  // 003 removed insert/delete on households and household_members entirely, so these now fail with 42501 (permission
+  // denied) instead of "0 rows" or a row-level-security error.
+  errored("Member cannot insert into household_members directly (only via join_household) (42501)", "insert household_members",
+    await bea.sb.from("household_members").insert({ household_id: A, user_id: bea.id, display_name: "Bea" }).select("user_id"), PERMISSION_DENIED);
+  errored("...same without .select() (42501)", "insert household_members (no select)",
+    await bea.sb.from("household_members").insert({ household_id: A, user_id: bea.id, display_name: "Bea" }), PERMISSION_DENIED);
+  errored("Member cannot update their own role (42501)", "update household_members role", await sam.sb.from("household_members").update({ role: "owner" }).eq("user_id", sam.id).select("role"), PERMISSION_DENIED);
   errored("new_invite_code() is not callable", "rpc new_invite_code", await alex.sb.rpc("new_invite_code"));
-  errored("Member cannot create a household row directly", "insert households",
-    await sam.sb.from("households").insert({ name: "Direct", invite_code: "DIRECT01", created_by: sam.id }).select("id"));
-  rejected("Member cannot delete the household", "delete households", await sam.sb.from("households").delete().eq("id", A).select("id"));
-  rejected("Member cannot delete another member's row (kick)", "delete household_members of Alex by Sam",
-    await sam.sb.from("household_members").delete().eq("user_id", alex.id).eq("household_id", A).select("user_id"));
+  errored("Member cannot create a household row directly (42501)", "insert households",
+    await sam.sb.from("households").insert({ name: "Direct", invite_code: "DIRECT01", created_by: sam.id }).select("id"), PERMISSION_DENIED);
+  errored("...same without .select() (42501)", "insert households (no select)",
+    await sam.sb.from("households").insert({ name: "Direct", invite_code: "DIRECT02", created_by: sam.id }), PERMISSION_DENIED);
+  errored("Member cannot delete the household (42501)", "delete households", await sam.sb.from("households").delete().eq("id", A).select("id"), PERMISSION_DENIED);
+  errored("Owner cannot delete the household either (42501)", "delete households by owner", await alex.sb.from("households").delete().eq("id", A).select("id"), PERMISSION_DENIED);
+  errored("Member cannot delete another member's row / kick (42501)", "delete household_members of Alex by Sam",
+    await sam.sb.from("household_members").delete().eq("user_id", alex.id).eq("household_id", A).select("user_id"), PERMISSION_DENIED);
+  errored("Member cannot delete their OWN member row either (42501)", "delete household_members of Sam by Sam",
+    await sam.sb.from("household_members").delete().eq("user_id", sam.id).eq("household_id", A).select("user_id"), PERMISSION_DENIED);
+  const stillMembers = await alex.sb.from("household_members").select("user_id").eq("household_id", A);
+  check("Household A still has its 2 members and exists after all of that", stillMembers.data?.length === 2, "select household_members", brief(stillMembers), "2 rows");
+  console.log("NOTE  TRUNCATE is not reachable through the API (PostgREST has no truncate request), so it is not tested here.");
 
   const cy = await newUser("cy");
   await memberRowHardening(cy, A);
@@ -454,30 +539,57 @@ async function memberRowHardening(cy, A) {
   const c = await cy.sb.rpc("create_household", { p_name: `Test flat ${stamp} (C)`, p_display_name: "Cy" });
   check("Cy creates his own household C", !c.error && !!c.data, "rpc create_household", brief(c), "uuid");
   const C = c.data;
-  const mine = () => cy.sb.from("household_members").select("household_id, role, style_index, display_name").eq("user_id", cy.id);
+  const COLS = "household_id, user_id, role, style_index, joined_at, display_name";
+  const mine = () => cy.sb.from("household_members").select(COLS).eq("user_id", cy.id);
 
+  // The one thing a member may edit: display_name (with and without asking for the row back).
   const dn = await cy.sb.from("household_members").update({ display_name: "Cyrus" }).eq("user_id", cy.id).select("display_name");
-  accepted("Cy can change his display_name (intended)", "update display_name", dn);
-  rejected("Cy cannot change his style_index", "update style_index=7", await cy.sb.from("household_members").update({ style_index: 7 }).eq("user_id", cy.id).select("style_index"));
-  rejected("Cy cannot change his role", "update role='member'", await cy.sb.from("household_members").update({ role: "member" }).eq("user_id", cy.id).select("role"));
-  rejected("Cy cannot change joined_at", "update joined_at", await cy.sb.from("household_members").update({ joined_at: "2000-01-01T00:00:00Z" }).eq("user_id", cy.id).select("joined_at"));
+  accepted("Cy can change his display_name (intended), with .select()", "update display_name", dn);
+  const dn2 = await cy.sb.from("household_members").update({ display_name: "Cyrus II" }).eq("user_id", cy.id);
+  const dn2Back = await mine();
+  check("Cy can change his display_name without .select() too", !dn2.error && dn2Back.data?.[0]?.display_name === "Cyrus II",
+    "update display_name (no select)", (dn2.error ? dn2.error.message : `status ${dn2.status}`) + "; now " + show(dn2Back.data?.[0]?.display_name), "no error, display_name = Cyrus II");
+  errored("display_name of 41 chars rejected", "update display_name 41 chars",
+    await cy.sb.from("household_members").update({ display_name: str(41) }).eq("user_id", cy.id).select("display_name"), "23514");
 
-  // The big one: can a member move his own row into ANOTHER household, skipping the invite code and the
-  // 12-person limit? (He first deletes his household's areas, which block the move through a foreign key.)
+  // Snapshot the row, then try to change every other column in both request shapes.
+  const before = (await mine()).data?.[0];
+  console.log(`INFO  Cy's member row before the attempts: ${show(before)}`);
+
+  // A member first empties his own household's areas (they block moving the row through a foreign key), so the
+  // move to household A is blocked by permissions alone, not by a side effect.
   await cy.sb.from("areas").delete().eq("household_id", C);
-  // Two variants: with ".select()" (asks for the row back) and without (the supabase-js default). Postgres applies
-  // the read policy to the NEW row only when the row is returned, so the second variant is the sharper test.
-  const moveRet = await cy.sb.from("household_members").update({ household_id: A }).eq("user_id", cy.id).select("household_id");
-  rejected("Cy cannot move himself into household A by editing household_id (asking for the row back)",
-    `update household_members set household_id=${A} .select()`, moveRet);
-  const moveMin = await cy.sb.from("household_members").update({ household_id: A }).eq("user_id", cy.id);
-  const afterMove = await mine();
-  check("Cy cannot move himself into household A by editing household_id (no row returned)",
-    afterMove.data?.[0]?.household_id === C, `update household_members set household_id=${A} (no select)`,
-    `update ${moveMin.error ? "error " + moveMin.error.message : "status " + moveMin.status}; Cy's household_id is now ${afterMove.data?.[0]?.household_id ?? "(none visible)"}`,
-    "household_id unchanged");
+
+  const attempts = [
+    ["household_id", A],
+    ["role", "member"],
+    ["style_index", 7],
+    ["joined_at", "2000-01-01T00:00:00Z"],
+    ["user_id", randomUUID()],
+  ];
+  for (const [col, value] of attempts) {
+    // Variant 1: asks for the row back (.select()). Variant 2: the supabase-js default, no row returned.
+    const withSel = await cy.sb.from("household_members").update({ [col]: value }).eq("user_id", cy.id).select(col);
+    errored(`Cy cannot change his own ${col} (with .select()) - expect 42501`, `update household_members set ${col}=${show(value)} .select()`, withSel, PERMISSION_DENIED);
+    const afterSel = (await mine()).data?.[0];
+    check(`...row unchanged afterwards (${col}, with .select())`, show(afterSel) === show(before), "re-select own member row", show(afterSel), show(before));
+
+    const noSel = await cy.sb.from("household_members").update({ [col]: value }).eq("user_id", cy.id);
+    errored(`Cy cannot change his own ${col} (no .select()) - expect 42501`, `update household_members set ${col}=${show(value)} (no select)`, noSel, PERMISSION_DENIED);
+    const afterNo = (await mine()).data?.[0];
+    check(`...row unchanged afterwards (${col}, no .select())`, show(afterNo) === show(before), "re-select own member row", show(afterNo), show(before));
+  }
+
+  // A multi-column update that mixes the allowed column with a forbidden one must be refused as a whole.
+  const mixed = await cy.sb.from("household_members").update({ display_name: "Sneaky", household_id: A }).eq("user_id", cy.id).select("household_id");
+  errored("Mixed update (display_name + household_id) is refused as a whole (42501)", "update display_name + household_id", mixed, PERMISSION_DENIED);
+  const afterMixed = (await mine()).data?.[0];
+  check("...and display_name was NOT changed by the refused mixed update", show(afterMixed) === show(before), "re-select own member row", show(afterMixed), show(before));
+
   const peek = await cy.sb.from("logs").select("id").eq("household_id", A);
   check("Cy still sees 0 of household A's logs", !peek.error && peek.data.length === 0, "select logs of A as Cy", brief(peek), "0 rows");
+  const peekM = await cy.sb.from("household_members").select("user_id").eq("household_id", A);
+  check("Cy still sees 0 of household A's members", !peekM.error && peekM.data.length === 0, "select household_members of A as Cy", brief(peekM), "0 rows");
   const where = await mine();
   console.log(`INFO  Cy's member row afterwards: ${show(where.data)}`);
 }
